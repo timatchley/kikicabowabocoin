@@ -13,11 +13,15 @@ VERSION = "1.0.0"
 # --- Network ---
 DEFAULT_PORT = 44144
 RPC_PORT = 44145
+DISCOVERY_PORT = 44146          # UDP port for LAN peer discovery broadcasts
+DISCOVERY_INTERVAL = 30         # Seconds between discovery broadcasts
 MAGIC_BYTES = b"\xc1\xc1\xca\xb0"  # Network magic for packet framing
 MAX_PEERS = 125
 SEED_NODES = [
-    # No live seed nodes yet – add your own here
+    # Hardcoded bootstrap nodes — real decentralized networks ship these
+    # so brand-new nodes can find the network without knowing any IP.
     # ("seed1.kikicabowabo.coin", DEFAULT_PORT),
+    # ("seed2.kikicabowabo.coin", DEFAULT_PORT),
 ]
 
 # --- Block Parameters (Dogecoin-style) ---

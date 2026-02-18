@@ -258,9 +258,18 @@ def cmd_node(args):
     mempool = Mempool.load()
     node = Node(bc, mempool, port=args.port)
 
+    # Disable LAN discovery if requested
+    if getattr(args, 'no_discovery', False):
+        node._discovery_disabled = True
+
     print(BANNER.format(version=__version__, ticker=__ticker__))
     print(f"  Starting node on port {args.port}…")
-    print(f"  Chain height: {bc.height}\n")
+    print(f"  Chain height: {bc.height}")
+    if not getattr(args, 'no_discovery', False):
+        print(f"  📡 LAN peer discovery: enabled (automatic)")
+    if args.peers:
+        print(f"  Manual peers: {', '.join(args.peers)}")
+    print()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -443,7 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
     node_p.add_argument("--mine-address", type=str, help="Mining reward address")
     node_p.add_argument(
         "--peer", dest="peers", action="append", default=[],
-        help="Peer to connect to (host:port). Can be repeated.",
+        help="Extra peer to connect to (host:port). Optional — nodes "
+             "discover each other automatically on the LAN.",
+    )
+    node_p.add_argument(
+        "--no-discovery", action="store_true",
+        help="Disable automatic LAN peer discovery (UDP broadcast)",
     )
 
     return parser

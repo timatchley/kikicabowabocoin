@@ -17,11 +17,18 @@ import os
 import time
 from typing import Dict, List, Optional, Set
 
+import socket
+import struct
+
 from kikicabowabocoin.config import (
     DEFAULT_PORT,
+    DISCOVERY_PORT,
+    DISCOVERY_INTERVAL,
     MAX_PEERS,
     DATA_DIR,
     PEERS_FILE,
+    SEED_NODES,
+    MAGIC_BYTES,
 )
 from kikicabowabocoin.blockchain import Block, Blockchain
 from kikicabowabocoin.transaction import Transaction
@@ -31,6 +38,176 @@ logger = logging.getLogger("kiki.network")
 
 # Maximum number of blocks to send in a single sync batch
 SYNC_BATCH = 50
+
+# Discovery magic prefix (4 bytes) used to identify our UDP packets
+_DISCO_MAGIC = b"KIKI"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# LAN Peer Discovery — UDP broadcast / listen
+# ───────────────────────────────────────────────────────────────────────────
+
+class LanDiscovery:
+    """
+    Automatic peer discovery on the local network via UDP broadcast.
+
+    Every DISCOVERY_INTERVAL seconds, the node broadcasts a small JSON
+    beacon on the LAN.  Other nodes listening on the same UDP port pick
+    it up and initiate a TCP connection — no manual --peer flag needed.
+
+    This is how real decentralized networks bootstrap on a LAN segment.
+    Internet-scale discovery uses DNS seeds and hardcoded seed nodes
+    instead (handled separately via SEED_NODES in config).
+    """
+
+    def __init__(self, node: "Node"):
+        self.node = node
+        self._sock_send = None    # UDP socket for broadcasting
+        self._sock_recv = None    # UDP socket for receiving
+        self._running = False
+
+    async def start(self):
+        """Start broadcasting and listening for peers."""
+        self._running = True
+
+        # ── Receive socket ──────────────────────────────────────────────
+        self._sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except AttributeError:
+            pass  # SO_REUSEPORT not available on all platforms
+        self._sock_recv.bind(("", DISCOVERY_PORT))
+        self._sock_recv.setblocking(False)
+
+        # ── Send socket ─────────────────────────────────────────────────
+        self._sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        logger.info(
+            "📡 LAN discovery active on UDP port {} (broadcast every {}s)".format(
+                DISCOVERY_PORT, DISCOVERY_INTERVAL
+            )
+        )
+
+        # Launch broadcast and listen as concurrent tasks
+        asyncio.ensure_future(self._broadcast_loop())
+        asyncio.ensure_future(self._listen_loop())
+
+    async def stop(self):
+        self._running = False
+        if self._sock_send:
+            self._sock_send.close()
+        if self._sock_recv:
+            self._sock_recv.close()
+
+    def _build_beacon(self):
+        """Build a compact discovery beacon."""
+        beacon = json.dumps({
+            "magic": _DISCO_MAGIC.decode(),
+            "port": self.node.port,
+            "height": self.node.blockchain.height,
+            "version": "1.0.0",
+        })
+        return beacon.encode()
+
+    async def _broadcast_loop(self):
+        """Periodically broadcast our presence on the LAN."""
+        loop = asyncio.get_event_loop()
+        while self._running:
+            try:
+                data = self._build_beacon()
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._sock_send.sendto(
+                        data, ("255.255.255.255", DISCOVERY_PORT)
+                    ),
+                )
+                logger.debug("📡 Broadcast discovery beacon")
+            except Exception as e:
+                logger.debug("Discovery broadcast error: {}".format(e))
+            await asyncio.sleep(DISCOVERY_INTERVAL)
+
+    async def _listen_loop(self):
+        """Listen for beacons from other nodes and connect to them."""
+        loop = asyncio.get_event_loop()
+        while self._running:
+            try:
+                data, addr = await loop.run_in_executor(
+                    None, lambda: self._recv_timeout()
+                )
+                if data is None:
+                    continue
+
+                msg = json.loads(data.decode())
+                if msg.get("magic") != _DISCO_MAGIC.decode():
+                    continue
+
+                peer_host = addr[0]
+                peer_port = msg.get("port", DEFAULT_PORT)
+                peer_addr = "{}:{}".format(peer_host, peer_port)
+
+                # Don't connect to ourselves
+                if self._is_self(peer_host, peer_port):
+                    continue
+
+                # Already connected?
+                if peer_addr in self.node.peers:
+                    continue
+
+                logger.info(
+                    "🔍 Discovered peer {} (height={}) via LAN broadcast".format(
+                        peer_addr, msg.get("height", "?")
+                    )
+                )
+                await self.node.connect_to_peer(peer_host, peer_port)
+
+            except Exception as e:
+                logger.debug("Discovery listen error: {}".format(e))
+                await asyncio.sleep(1)
+
+    def _recv_timeout(self):
+        """Blocking recv with a short timeout so we can check _running."""
+        import select
+        ready, _, _ = select.select([self._sock_recv], [], [], 2.0)
+        if ready:
+            return self._sock_recv.recvfrom(4096)
+        return None, None
+
+    def _is_self(self, host, port):
+        """Check if the discovered peer is actually us."""
+        if port != self.node.port:
+            return False
+        # Check common self-addresses
+        if host in ("127.0.0.1", "0.0.0.0", "localhost"):
+            return True
+        # Check our own IPs
+        try:
+            local_ips = set()
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                local_ips.add(info[4][0])
+            # Also get all interface IPs
+            try:
+                import fcntl
+                import struct as _struct
+                # Try to enumerate interface IPs (Linux-specific)
+                for iface in os.listdir("/sys/class/net/"):
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        ip = socket.inet_ntoa(fcntl.ioctl(
+                            s.fileno(),
+                            0x8915,  # SIOCGIFADDR
+                            _struct.pack("256s", iface.encode()[:15])
+                        )[20:24])
+                        local_ips.add(ip)
+                        s.close()
+                    except Exception:
+                        pass
+            except ImportError:
+                pass
+            return host in local_ips
+        except Exception:
+            return False
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -134,6 +311,7 @@ class Node:
         self._known_tx_hashes = set()
         self._server = None
         self._seed_peers = set()  # (host, port) pairs to reconnect to
+        self._discovery = None    # LAN discovery instance
 
         # Callback fired when a new block is accepted (from peer or mined)
         self.on_block_accepted = None
@@ -156,11 +334,27 @@ class Node:
         # Try to reconnect to previously known peers
         await self._load_and_connect_peers()
 
+        # Connect to hardcoded seed nodes (DNS seeds / bootstrap nodes)
+        for host, port in SEED_NODES:
+            self._seed_peers.add((host, port))
+            addr = "{}:{}".format(host, port)
+            if addr not in self.peers:
+                await self.connect_to_peer(host, port)
+
+        # Start LAN broadcast discovery (automatic peer finding)
+        if not getattr(self, '_discovery_disabled', False):
+            self._discovery = LanDiscovery(self)
+            await self._discovery.start()
+        else:
+            logger.info("📡 LAN discovery disabled by user")
+
         # Start background reconnect loop
         asyncio.ensure_future(self._reconnect_loop())
 
     async def stop(self):
         """Gracefully shut down."""
+        if self._discovery:
+            await self._discovery.stop()
         if self._server:
             self._server.close()
         for peer in list(self.peers.values()):

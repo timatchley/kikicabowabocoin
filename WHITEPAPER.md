@@ -141,16 +141,17 @@ In the KIKI community, we measure value in **Noodles**:
 - ✅ Core blockchain implementation
 - ✅ Wallet with ECDSA key management
 - ✅ Scrypt PoW mining
-- ✅ P2P networking protocol
+- ✅ P2P networking protocol (live on 2-node network)
 - ✅ CLI interface
-- ✅ Full test suite
+- ✅ Full test suite (70+ tests)
+- ✅ Chain sync between desktop and Raspberry Pi verified
 
 ### Phase 2: Off the Leash (Q2 2026)
 - 🔲 Public testnet launch
 - 🔲 Seed node infrastructure
 - 🔲 Block explorer web UI
 - 🔲 Wallet encryption
-- 🔲 Docker deployment for one-command node setup
+- ✅ Docker deployment for one-command node setup
 
 ### Phase 3: Zoomies (Q3 2026)
 - 🔲 Mainnet launch

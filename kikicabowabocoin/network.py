@@ -133,6 +133,7 @@ class Node:
         self._known_block_hashes = set()
         self._known_tx_hashes = set()
         self._server = None
+        self._seed_peers = set()  # (host, port) pairs to reconnect to
 
         # Callback fired when a new block is accepted (from peer or mined)
         self.on_block_accepted = None
@@ -154,6 +155,9 @@ class Node:
 
         # Try to reconnect to previously known peers
         await self._load_and_connect_peers()
+
+        # Start background reconnect loop
+        asyncio.ensure_future(self._reconnect_loop())
 
     async def stop(self):
         """Gracefully shut down."""
@@ -180,6 +184,9 @@ class Node:
     async def connect_to_peer(self, host, port):
         """Initiate an outbound connection."""
         addr = "{}:{}".format(host, port)
+        # Remember this peer for auto-reconnect
+        self._seed_peers.add((host, port))
+
         if addr in self.peers:
             return
         # Don't connect to self
@@ -492,6 +499,11 @@ class Node:
             {"host": p.host, "port": p.listen_port, "last_seen": time.time()}
             for p in self.peers.values()
         ]
+        # Also save seed peers so they survive restarts
+        for host, port in self._seed_peers:
+            key = "{}:{}".format(host, port)
+            if not any(d["host"] == host and d["port"] == port for d in data):
+                data.append({"host": host, "port": port, "last_seen": 0})
         with open(PEERS_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -505,6 +517,18 @@ class Node:
                 await self.connect_to_peer(p["host"], p["port"])
         except (json.JSONDecodeError, KeyError):
             pass
+
+    # ── Auto-reconnect ──────────────────────────────────────────────────
+
+    async def _reconnect_loop(self):
+        """Periodically try to reconnect to known seed peers."""
+        while True:
+            await asyncio.sleep(15)  # Check every 15 seconds
+            for host, port in list(self._seed_peers):
+                addr = "{}:{}".format(host, port)
+                if addr not in self.peers:
+                    logger.debug("🔄 Reconnecting to {}...".format(addr))
+                    await self.connect_to_peer(host, port)
 
     # ── Status ──────────────────────────────────────────────────────────
 

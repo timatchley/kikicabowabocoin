@@ -44,8 +44,13 @@ class Miner:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._cancel = threading.Event()  # Set to abort current block
         self.hashrate: float = 0.0
         self.blocks_mined: int = 0
+
+    def cancel(self):
+        """Cancel current mining work (e.g. new block arrived from network)."""
+        self._cancel.set()
 
     # --- Single block mining -------------------------------------------------
 
@@ -104,10 +109,19 @@ class Miner:
         # PoW loop: iterate nonces
         start_time = time.time()
         nonce = 0
+        self._cancel.clear()  # Reset cancel flag for this block
 
         while nonce < max_nonce:
             if not self._running and self._thread is not None:
                 # Stopped by external call
+                return None
+
+            # Check if we've been told to cancel (new block from network)
+            if self._cancel.is_set():
+                logger.info(
+                    f"🔄 Block #{height} cancelled — new block received "
+                    f"from network (chain now at #{self.blockchain.height})"
+                )
                 return None
 
             header.nonce = nonce
@@ -125,6 +139,15 @@ class Miner:
                     block_hash=block_hash,
                 )
 
+                # Check if chain moved ahead while we were mining
+                # (block arrived from peer between cancel checks)
+                if self.blockchain.height >= height:
+                    logger.info(
+                        f"🔄 Block #{height} solved but chain already at "
+                        f"#{self.blockchain.height} — discarding stale block"
+                    )
+                    return None
+
                 logger.info(
                     f"✅ Block #{height} mined! "
                     f"hash={block_hash[:24]}… nonce={nonce} "
@@ -132,7 +155,14 @@ class Miner:
                 )
 
                 # Add to our chain
-                self.blockchain.add_block(block)
+                try:
+                    self.blockchain.add_block(block)
+                except ValueError as e:
+                    logger.info(
+                        f"🔄 Mined block #{height} rejected (chain moved): {e}"
+                    )
+                    return None
+
                 self.blocks_mined += 1
 
                 if self.on_block_mined:
@@ -145,7 +175,6 @@ class Miner:
             # Update timestamp occasionally (keep it fresh)
             if nonce % 100_000 == 0:
                 header.timestamp = time.time()
-                # Recompute merkle root isn't needed (txs unchanged)
 
         logger.warning(f"Max nonce reached for block #{height}, retrying…")
         return None

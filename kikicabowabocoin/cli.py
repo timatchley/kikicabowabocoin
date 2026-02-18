@@ -289,6 +289,17 @@ def cmd_node(args):
         if args.mine and miner_address:
             miner_obj = Miner(bc, miner_address)
 
+            # When a block arrives from the network, cancel the miner
+            # so it immediately restarts on the new tip
+            def on_network_block(block):
+                miner_obj.cancel()
+                logger.info(
+                    "📡 Network block #{} → cancelling miner, will restart "
+                    "on new tip".format(block.height)
+                )
+
+            node.on_block_accepted = on_network_block
+
             async def mine_loop():
                 while True:
                     # Pull txs from mempool

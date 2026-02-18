@@ -26,8 +26,16 @@ Group=kiki
 WorkingDirectory=/opt/kikicabowabocoin
 Environment="HOME=/opt/kikicabowabocoin"
 
+# Configuration — edit these for your setup
+Environment="KIKI_PORT=44144"
+Environment="KIKI_PEERS="
+# Set KIKI_MINE=--mine to enable mining, or leave empty
+Environment="KIKI_MINE="
+
 # Start the node
-ExecStart=/opt/kikicabowabocoin/venv/bin/kiki node --port 44144
+# To add peers: set KIKI_PEERS="--peer 1.2.3.4:44144 --peer 5.6.7.8:44144"
+# To enable mining: set KIKI_MINE="--mine"
+ExecStart=/bin/bash -c '/opt/kikicabowabocoin/venv/bin/kiki node --port ${KIKI_PORT} ${KIKI_MINE} ${KIKI_PEERS}'
 
 # Graceful shutdown
 ExecStop=/bin/kill -SIGINT $MAINPID

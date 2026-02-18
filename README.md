@@ -83,7 +83,43 @@ kiki node --port 44144
 
 # Start node with mining enabled
 kiki node --mine
+
+# Connect to a specific peer
+kiki node --mine --peer 192.168.1.100:44144
+
+# Connect to multiple peers
+kiki node --mine --peer 192.168.1.100:44144 --peer 10.0.0.5:44144
 ```
+
+## 🌐 Networking
+
+KIKI nodes communicate via a gossip protocol over TCP (port 44144). When two
+nodes connect they perform a VERSION/VERACK handshake, then the node with the
+shorter chain downloads blocks from its peer (Initial Block Download). After
+sync, newly mined blocks and transactions are relayed in real-time.
+
+```
+  Desktop (192.168.1.10)            Raspberry Pi (192.168.1.20)
+  ┌─────────────────┐               ┌──────────────────┐
+  │  kiki node       │◄─────────────►│  kiki node        │
+  │  --mine          │  TCP 44144    │  --mine           │
+  │  height: 16      │  blocks/txs   │  height: 16       │
+  └─────────────────┘               └──────────────────┘
+```
+
+### Multi-Node Setup
+
+1. **Start the first node** on Machine A:
+   ```bash
+   kiki node --mine
+   ```
+
+2. **Start the second node** on Machine B, pointing at Machine A:
+   ```bash
+   kiki node --mine --peer 192.168.1.10:44144
+   ```
+
+3. Both nodes will sync to the longest chain and relay new blocks to each other.
 
 ## 🏗️ Architecture
 
@@ -139,6 +175,7 @@ All blockchain data, wallet keys, and peer info are stored in:
 ~/.kikicabowabocoin/
 ├── chain.json       # Blockchain data
 ├── wallet.json      # Wallet keys (back this up!)
+├── mempool.json     # Pending unconfirmed transactions
 ├── peers.json       # Known peer addresses
 └── kiki.log         # Node log
 ```

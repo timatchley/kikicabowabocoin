@@ -23,6 +23,7 @@ services:
       - kiki-data:/root/.kikicabowabocoin
     environment:
       - KIKI_LOG_LEVEL=INFO
+      - KIKI_PEERS=          # e.g. "--peer 1.2.3.4:44144"
     command: ["node", "--port", "44144"]
     healthcheck:
       test: ["CMD", "pgrep", "-f", "kikicabowabocoin"]
@@ -46,6 +47,8 @@ services:
     environment:
       - KIKI_LOG_LEVEL=INFO
     command: ["node", "--port", "44144", "--mine"]
+    environment:
+      - KIKI_LOG_LEVEL=INFO
     depends_on:
       kiki-node:
         condition: service_healthy

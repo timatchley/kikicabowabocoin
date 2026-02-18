@@ -6,12 +6,14 @@ Transactions are ordered by fee rate (fee per byte), just like
 Bitcoin/Dogecoin.
 """
 
+import json
 import logging
+import os
 import threading
 import time
 from typing import Dict, List, Optional
 
-from kikicabowabocoin.config import MIN_TX_FEE, MAX_TX_SIZE
+from kikicabowabocoin.config import MIN_TX_FEE, MAX_TX_SIZE, MEMPOOL_FILE, DATA_DIR
 from kikicabowabocoin.transaction import Transaction
 
 logger = logging.getLogger("kiki.mempool")
@@ -130,3 +132,30 @@ class Mempool:
 
     def __repr__(self) -> str:
         return f"<Mempool size={self.size}>"
+
+    # --- Persistence ---------------------------------------------------------
+
+    def save(self, path: str = MEMPOOL_FILE):
+        """Persist mempool to disk so pending txs survive restarts."""
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with self._lock:
+            data = [tx.serialize() for tx in self._pool.values()]
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.debug(f"Mempool saved ({len(data)} txs) → {path}")
+
+    @classmethod
+    def load(cls, path: str = MEMPOOL_FILE) -> "Mempool":
+        """Load mempool from disk."""
+        mp = cls()
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                for tx_data in data:
+                    tx = Transaction.deserialize(tx_data)
+                    mp._pool[tx.tx_hash] = tx
+                logger.info(f"Mempool loaded ({len(mp._pool)} txs) from {path}")
+            except (json.JSONDecodeError, KeyError, Exception) as e:
+                logger.warning(f"Failed to load mempool: {e}")
+        return mp

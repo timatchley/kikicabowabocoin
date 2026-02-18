@@ -63,5 +63,6 @@ GENESIS_MESSAGE = "KikicabowaboCoin - much wow, very coin, so crypto!"
 DATA_DIR = os.path.expanduser("~/.kikicabowabocoin")
 BLOCKCHAIN_DB = os.path.join(DATA_DIR, "blockchain.db")
 WALLET_FILE = os.path.join(DATA_DIR, "wallet.json")
+MEMPOOL_FILE = os.path.join(DATA_DIR, "mempool.json")
 PEERS_FILE = os.path.join(DATA_DIR, "peers.json")
 LOG_FILE = os.path.join(DATA_DIR, "kiki.log")

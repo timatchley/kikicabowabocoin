@@ -34,6 +34,8 @@ from kikicabowabocoin.miner import Miner
 from kikicabowabocoin.mempool import Mempool
 from kikicabowabocoin.network import Node
 
+logger = logging.getLogger("kiki.cli")
+
 
 BANNER = r"""
   _  ___ _    _           _                         _            ____      _
@@ -162,8 +164,9 @@ def cmd_send(args):
         print(f"\n   Transaction will be included in the next mined block.\n")
 
         # Add to mempool (in a full node, this would broadcast too)
-        mempool = Mempool()
+        mempool = Mempool.load()
         mempool.add_transaction(tx)
+        mempool.save()
 
     except ValueError as e:
         print(f"\n❌ Error: {e}\n")
@@ -173,7 +176,7 @@ def cmd_mine(args):
     """Mine blocks."""
     wallet = get_wallet()
     bc = get_blockchain()
-    mempool = Mempool()
+    mempool = Mempool.load()
 
     address = args.address or wallet.default_address
     num_blocks = args.blocks or 1
@@ -202,8 +205,9 @@ def cmd_mine(args):
             # Remove mined txs from mempool
             for tx in block.transactions[1:]:
                 mempool.remove_transaction(tx.tx_hash)
-            # Save after every block so other commands can see progress
+            # Save chain and mempool after every block
             bc.save()
+            mempool.save()
 
     wallet.save()
 
@@ -249,32 +253,104 @@ def cmd_block(args):
 
 
 def cmd_node(args):
-    """Start a full network node."""
+    """Start a full network node (optionally mining)."""
     bc = get_blockchain()
-    mempool = Mempool()
+    mempool = Mempool.load()
     node = Node(bc, mempool, port=args.port)
 
     print(BANNER.format(version=__version__, ticker=__ticker__))
-    print(f"  Starting node on port {args.port}…\n")
+    print(f"  Starting node on port {args.port}…")
+    print(f"  Chain height: {bc.height}\n")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    miner = None
+    miner_address = None
+
+    if args.mine:
+        wallet = get_wallet()
+        miner_address = args.mine_address or wallet.default_address
+        print(f"  ⛏  Mining enabled → {miner_address}\n")
+
+    async def run():
+        await node.start()
+
+        # Connect to explicitly specified peers
+        if args.peers:
+            for p in args.peers:
+                if ":" in p:
+                    host, port_str = p.rsplit(":", 1)
+                    await node.connect_to_peer(host, int(port_str))
+                else:
+                    await node.connect_to_peer(p, DEFAULT_PORT)
+
+        # Mining loop (runs in the asyncio loop with yielding)
+        if args.mine and miner_address:
+            miner_obj = Miner(bc, miner_address)
+
+            async def mine_loop():
+                while True:
+                    # Pull txs from mempool
+                    txs = mempool.get_transactions()
+
+                    # Mine in a thread so we don't block the event loop
+                    block = await loop.run_in_executor(
+                        None, lambda: miner_obj.mine_block(transactions=txs)
+                    )
+
+                    if block:
+                        # Remove mined txs from mempool
+                        for tx in block.transactions[1:]:
+                            mempool.remove_transaction(tx.tx_hash)
+                        bc.save()
+                        mempool.save()
+
+                        balance = bc.get_balance(miner_address)
+                        print(
+                            f"   ✅ Block #{block.height} mined | "
+                            f"hash={block.block_hash[:24]}… | "
+                            f"balance={balance:,} {__ticker__} | "
+                            f"peers={len(node.peers)}"
+                        )
+
+                        # Broadcast to all peers
+                        await node.broadcast_block(block)
+
+                    # Small yield to let network messages process
+                    await asyncio.sleep(0.1)
+
+            asyncio.ensure_future(mine_loop())
+
+        # Status printer
+        async def status_printer():
+            while True:
+                await asyncio.sleep(60)
+                status = node.get_status()
+                logger.info(
+                    "📊 height={} peers={} mempool={}".format(
+                        status["chain_height"],
+                        status["peers"],
+                        status["mempool_size"],
+                    )
+                )
+
+        asyncio.ensure_future(status_printer())
+
+        # Run forever
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
     try:
-        loop.run_until_complete(node.start())
-
-        if args.mine:
-            wallet = get_wallet()
-            address = args.mine_address or wallet.default_address
-            miner = Miner(bc, address, on_block_mined=node.broadcast_block)
-            miner.start(mempool)
-            print(f"  ⛏  Mining to {address}\n")
-
-        loop.run_forever()
+        loop.run_until_complete(run())
     except KeyboardInterrupt:
         print("\n  Shutting down…")
         loop.run_until_complete(node.stop())
-        bc.save()
+        print(f"  Chain height: {bc.height}")
+        print(f"  Chain saved. Goodbye! 🐕\n")
 
 
 def cmd_genesis(args):
@@ -354,6 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     node_p.add_argument("--mine", action="store_true", help="Enable mining")
     node_p.add_argument("--mine-address", type=str, help="Mining reward address")
+    node_p.add_argument(
+        "--peer", dest="peers", action="append", default=[],
+        help="Peer to connect to (host:port). Can be repeated.",
+    )
 
     return parser
 

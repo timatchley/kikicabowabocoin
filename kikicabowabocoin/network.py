@@ -1,14 +1,13 @@
 """
 Peer-to-Peer networking for KikicabowaboCoin.
 
-Implements a simple gossip protocol for:
+Implements a gossip protocol using asyncio streams for:
 - Node discovery
-- Block propagation
+- Block propagation  (new blocks broadcast to all peers)
 - Transaction propagation
-- Chain synchronisation
+- Initial Block Download (IBD) — sync the longest chain on connect
 
-Similar in spirit to Dogecoin's networking (inherited from Bitcoin),
-but simplified for clarity.
+Compatible with Python 3.7+ (Raspberry Pi Buster ships 3.7.3).
 """
 
 import asyncio
@@ -16,13 +15,11 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from kikicabowabocoin.config import (
     DEFAULT_PORT,
     MAX_PEERS,
-    SEED_NODES,
     DATA_DIR,
     PEERS_FILE,
 )
@@ -32,213 +29,92 @@ from kikicabowabocoin.mempool import Mempool
 
 logger = logging.getLogger("kiki.network")
 
-
-# ===========================================================================
-# Message types
-# ===========================================================================
-
-class MessageType:
-    VERSION = "version"
-    VERACK = "verack"
-    GETBLOCKS = "getblocks"
-    INV = "inv"
-    GETDATA = "getdata"
-    BLOCK = "block"
-    TX = "tx"
-    GETADDR = "getaddr"
-    ADDR = "addr"
-    PING = "ping"
-    PONG = "pong"
+# Maximum number of blocks to send in a single sync batch
+SYNC_BATCH = 50
 
 
-# ===========================================================================
-# Peer info
-# ===========================================================================
+# ───────────────────────────────────────────────────────────────────────────
+# Peer connection — wraps a reader/writer pair
+# ───────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class PeerInfo:
-    host: str
-    port: int
-    last_seen: float = field(default_factory=time.time)
-    version: str = ""
-    height: int = 0
+class Peer:
+    """Represents a single TCP connection to another node."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        node: "Node",
+        inbound: bool = False,
+    ):
+        self.reader = reader
+        self.writer = writer
+        self.node = node
+        self.inbound = inbound
+
+        peer = writer.get_extra_info("peername")
+        self.host = peer[0] if peer else "unknown"
+        self.port = peer[1] if peer else 0
+        self.listen_port = 0  # filled in after VERSION handshake
+        self.height = 0
+        self.connected_at = time.time()
+        self._closing = False
 
     @property
-    def address(self) -> str:
-        return f"{self.host}:{self.port}"
+    def address(self):
+        """Canonical address used as dict key (uses listen port, not ephemeral)."""
+        p = self.listen_port if self.listen_port else self.port
+        return "{}:{}".format(self.host, p)
 
+    # ── Send / Receive ──────────────────────────────────────────────────
 
-# ===========================================================================
-# Protocol handler
-# ===========================================================================
-
-class PeerProtocol(asyncio.Protocol):
-    """Handles communication with a single peer."""
-
-    def __init__(self, node: "Node"):
-        self.node = node
-        self.transport = None
-        self.peer_info: Optional[PeerInfo] = None
-        self._buffer = b""
-
-    def connection_made(self, transport):
-        self.transport = transport
-        peername = transport.get_extra_info("peername")
-        logger.info(f"🔗 Connected to {peername}")
-        # Send version message
-        self.send_message(MessageType.VERSION, {
-            "version": "1.0.0",
-            "height": self.node.blockchain.height,
-            "timestamp": time.time(),
-        })
-
-    def connection_lost(self, exc):
-        if self.peer_info:
-            self.node.remove_peer(self.peer_info.address)
-            logger.info(f"🔌 Disconnected from {self.peer_info.address}")
-
-    def data_received(self, data: bytes):
-        self._buffer += data
-        while b"\n" in self._buffer:
-            line, self._buffer = self._buffer.split(b"\n", 1)
-            try:
-                message = json.loads(line.decode())
-                self._handle_message(message)
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                logger.warning(f"Invalid message: {e}")
-
-    def send_message(self, msg_type: str, payload: dict):
-        """Send a JSON message to this peer."""
-        message = {"type": msg_type, "payload": payload}
-        data = json.dumps(message).encode() + b"\n"
-        if self.transport and not self.transport.is_closing():
-            self.transport.write(data)
-
-    def _handle_message(self, message: dict):
-        msg_type = message.get("type")
-        payload = message.get("payload", {})
-
-        handlers = {
-            MessageType.VERSION: self._on_version,
-            MessageType.VERACK: self._on_verack,
-            MessageType.GETBLOCKS: self._on_getblocks,
-            MessageType.INV: self._on_inv,
-            MessageType.GETDATA: self._on_getdata,
-            MessageType.BLOCK: self._on_block,
-            MessageType.TX: self._on_tx,
-            MessageType.GETADDR: self._on_getaddr,
-            MessageType.ADDR: self._on_addr,
-            MessageType.PING: self._on_ping,
-            MessageType.PONG: self._on_pong,
-        }
-
-        handler = handlers.get(msg_type)
-        if handler:
-            handler(payload)
-        else:
-            logger.debug(f"Unknown message type: {msg_type}")
-
-    # --- Message handlers ----------------------------------------------------
-
-    def _on_version(self, payload: dict):
-        peername = self.transport.get_extra_info("peername")
-        self.peer_info = PeerInfo(
-            host=peername[0],
-            port=peername[1],
-            version=payload.get("version", ""),
-            height=payload.get("height", 0),
-        )
-        self.node.add_peer(self.peer_info, self)
-        self.send_message(MessageType.VERACK, {})
-
-        # If peer has a longer chain, request blocks
-        if self.peer_info.height > self.node.blockchain.height:
-            self.send_message(MessageType.GETBLOCKS, {
-                "start_height": self.node.blockchain.height + 1,
-            })
-
-    def _on_verack(self, payload: dict):
-        logger.debug("Received verack")
-
-    def _on_getblocks(self, payload: dict):
-        start = payload.get("start_height", 0)
-        blocks = []
-        for h in range(start, min(start + 500, self.node.blockchain.height + 1)):
-            block = self.node.blockchain.get_block_by_height(h)
-            if block:
-                blocks.append(block.serialize())
-        self.send_message(MessageType.INV, {"blocks": blocks})
-
-    def _on_inv(self, payload: dict):
-        for block_data in payload.get("blocks", []):
-            block = Block.deserialize(block_data)
-            try:
-                self.node.blockchain.add_block(block)
-                logger.info(f"📦 Synced block #{block.height}")
-            except ValueError as e:
-                logger.debug(f"Block rejected: {e}")
-
-    def _on_getdata(self, payload: dict):
-        block_hash = payload.get("block_hash")
-        if block_hash:
-            block = self.node.blockchain.get_block_by_hash(block_hash)
-            if block:
-                self.send_message(MessageType.BLOCK, block.serialize())
-
-        tx_hash = payload.get("tx_hash")
-        if tx_hash:
-            tx = self.node.mempool.get_transaction(tx_hash)
-            if tx:
-                self.send_message(MessageType.TX, tx.serialize())
-
-    def _on_block(self, payload: dict):
-        block = Block.deserialize(payload)
+    async def send(self, msg_type, payload):
+        """Send a newline-delimited JSON message."""
+        if self._closing:
+            return
+        msg = json.dumps({"type": msg_type, "payload": payload}) + "\n"
         try:
-            self.node.blockchain.add_block(block)
-            logger.info(f"📦 Received block #{block.height}")
-            # Relay to other peers
-            self.node.broadcast_block(block, exclude=self.peer_info.address)
-        except ValueError as e:
-            logger.debug(f"Block rejected: {e}")
+            self.writer.write(msg.encode())
+            await self.writer.drain()
+        except (ConnectionError, OSError):
+            await self.disconnect()
 
-    def _on_tx(self, payload: dict):
-        tx = Transaction.deserialize(payload)
-        if self.node.mempool.add_transaction(tx):
-            # Relay to other peers
-            self.node.broadcast_transaction(tx, exclude=self.peer_info.address)
+    async def recv(self):
+        """Read the next newline-delimited JSON message."""
+        try:
+            line = await self.reader.readline()
+            if not line:
+                return None
+            return json.loads(line.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.debug("Bad message from {}: {}".format(self.address, e))
+            return None
+        except (ConnectionError, OSError):
+            return None
 
-    def _on_getaddr(self, payload: dict):
-        addrs = [
-            {"host": p.host, "port": p.port}
-            for p in self.node.peers.values()
-        ]
-        self.send_message(MessageType.ADDR, {"addresses": addrs})
+    async def disconnect(self):
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            self.writer.close()
+        except Exception:
+            pass
 
-    def _on_addr(self, payload: dict):
-        for addr in payload.get("addresses", []):
-            host, port = addr["host"], addr["port"]
-            key = f"{host}:{port}"
-            if key not in self.node.peers:
-                asyncio.ensure_future(self.node.connect_to_peer(host, port))
-
-    def _on_ping(self, payload: dict):
-        self.send_message(MessageType.PONG, {"nonce": payload.get("nonce")})
-
-    def _on_pong(self, payload: dict):
-        if self.peer_info:
-            self.peer_info.last_seen = time.time()
+    def __repr__(self):
+        d = "in" if self.inbound else "out"
+        return "<Peer {} {} h={}>".format(self.address, d, self.height)
 
 
-# ===========================================================================
-# Node
-# ===========================================================================
+# ───────────────────────────────────────────────────────────────────────────
+# Full Node
+# ───────────────────────────────────────────────────────────────────────────
 
 class Node:
     """
-    A KikicabowaboCoin network node.
+    A KikicabowaboCoin full node.
 
-    Manages peer connections, block/transaction propagation, and
-    chain synchronisation.
+    Manages peer connections, block/tx propagation, and chain sync.
     """
 
     def __init__(
@@ -253,88 +129,367 @@ class Node:
         self.host = host
         self.port = port
 
-        self.peers: Dict[str, PeerInfo] = {}
-        self._connections: Dict[str, PeerProtocol] = {}
+        self.peers = {}           # address → Peer
+        self._known_block_hashes = set()
+        self._known_tx_hashes = set()
         self._server = None
-        self._loop = None
 
-    # --- Peer management -----------------------------------------------------
+        # Callback fired when a new block is accepted (from peer or mined)
+        self.on_block_accepted = None
 
-    def add_peer(self, peer: PeerInfo, protocol: PeerProtocol):
-        if len(self.peers) < MAX_PEERS:
-            self.peers[peer.address] = peer
-            self._connections[peer.address] = protocol
+        # Pre-populate known block hashes from our chain
+        for blk in self.blockchain.chain:
+            self._known_block_hashes.add(blk.block_hash)
 
-    def remove_peer(self, address: str):
-        self.peers.pop(address, None)
-        self._connections.pop(address, None)
-
-    # --- Broadcasting --------------------------------------------------------
-
-    def broadcast_block(self, block: Block, exclude: str = ""):
-        """Send a new block to all connected peers."""
-        data = block.serialize()
-        for addr, proto in self._connections.items():
-            if addr != exclude:
-                proto.send_message(MessageType.BLOCK, data)
-
-    def broadcast_transaction(self, tx: Transaction, exclude: str = ""):
-        """Send a new transaction to all connected peers."""
-        data = tx.serialize()
-        for addr, proto in self._connections.items():
-            if addr != exclude:
-                proto.send_message(MessageType.TX, data)
-
-    # --- Server lifecycle ----------------------------------------------------
+    # ── Lifecycle ───────────────────────────────────────────────────────
 
     async def start(self):
-        """Start listening for incoming peer connections."""
-        self._loop = asyncio.get_event_loop()
-
-        self._server = await self._loop.create_server(
-            lambda: PeerProtocol(self),
+        """Start listening for inbound connections."""
+        self._server = await asyncio.start_server(
+            self._handle_inbound,
             self.host,
             self.port,
         )
-        logger.info(f"🌐 Node listening on {self.host}:{self.port}")
+        logger.info("🌐 Node listening on {}:{}".format(self.host, self.port))
 
-        # Connect to seed nodes
-        for host, port in SEED_NODES:
-            await self.connect_to_peer(host, port)
-
-        # Load saved peers
+        # Try to reconnect to previously known peers
         await self._load_and_connect_peers()
 
     async def stop(self):
-        """Shut down the node."""
+        """Gracefully shut down."""
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+        for peer in list(self.peers.values()):
+            await peer.disconnect()
+        self.peers.clear()
         self._save_peers()
-        logger.info("Node shut down")
+        self.blockchain.save()
+        self.mempool.save()
+        logger.info("🛑 Node shut down")
 
-    async def connect_to_peer(self, host: str, port: int):
-        """Initiate an outbound connection to a peer."""
-        address = f"{host}:{port}"
-        if address in self.peers:
+    # ── Inbound connections ─────────────────────────────────────────────
+
+    async def _handle_inbound(self, reader, writer):
+        """Called for each new incoming connection."""
+        peer = Peer(reader, writer, self, inbound=True)
+        logger.info("🔗 Inbound connection from {}:{}".format(peer.host, peer.port))
+        await self._run_peer(peer)
+
+    # ── Outbound connections ────────────────────────────────────────────
+
+    async def connect_to_peer(self, host, port):
+        """Initiate an outbound connection."""
+        addr = "{}:{}".format(host, port)
+        if addr in self.peers:
+            return
+        # Don't connect to self
+        if port == self.port and host in ("127.0.0.1", "0.0.0.0", "localhost"):
             return
 
         try:
-            await self._loop.create_connection(
-                lambda: PeerProtocol(self),
-                host,
-                port,
-            )
-            logger.info(f"🔗 Connected to peer {address}")
+            reader, writer = await asyncio.open_connection(host, port)
+            peer = Peer(reader, writer, self, inbound=False)
+            peer.listen_port = port
+            logger.info("🔗 Outbound connection to {}".format(addr))
+            asyncio.ensure_future(self._run_peer(peer))
         except (ConnectionRefusedError, OSError) as e:
-            logger.debug(f"Could not connect to {address}: {e}")
+            logger.debug("Could not connect to {}: {}".format(addr, e))
 
-    # --- Peer persistence ----------------------------------------------------
+    # ── Main peer loop ──────────────────────────────────────────────────
+
+    async def _run_peer(self, peer):
+        """
+        Full peer lifecycle:
+        1. VERSION handshake
+        2. Initial chain sync (if peer has longer chain)
+        3. Message loop (blocks, txs, pings)
+        """
+        try:
+            # --- Handshake: send our VERSION ---
+            await peer.send("version", {
+                "version": "1.0.0",
+                "height": self.blockchain.height,
+                "listen_port": self.port,
+                "timestamp": time.time(),
+            })
+
+            # Wait for their VERSION
+            msg = await asyncio.wait_for(peer.recv(), timeout=10)
+            if not msg or msg.get("type") != "version":
+                logger.debug("Bad handshake from {}".format(peer.address))
+                await peer.disconnect()
+                return
+
+            payload = msg["payload"]
+            peer.height = payload.get("height", 0)
+            peer.listen_port = payload.get("listen_port", peer.port)
+
+            # Exchange VERACK
+            await peer.send("verack", {})
+
+            msg = await asyncio.wait_for(peer.recv(), timeout=10)
+            if not msg or msg.get("type") != "verack":
+                logger.debug("No verack from {}".format(peer.address))
+                await peer.disconnect()
+                return
+
+            # --- Register peer ---
+            if len(self.peers) >= MAX_PEERS:
+                logger.info("Max peers reached, rejecting {}".format(peer.address))
+                await peer.disconnect()
+                return
+
+            self.peers[peer.address] = peer
+            logger.info(
+                "✅ Peer {} connected | theirs={}, ours={}".format(
+                    peer.address, peer.height, self.blockchain.height
+                )
+            )
+
+            # --- Initial Block Download ---
+            if peer.height > self.blockchain.height:
+                await self._sync_from_peer(peer)
+
+            # --- Message loop ---
+            while not peer._closing:
+                try:
+                    msg = await asyncio.wait_for(peer.recv(), timeout=120)
+                except asyncio.TimeoutError:
+                    await peer.send("ping", {"nonce": int(time.time())})
+                    continue
+
+                if msg is None:
+                    break
+
+                await self._handle_message(peer, msg)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("Peer {} error: {}".format(
+                getattr(peer, 'address', '?'), e
+            ))
+        finally:
+            self.peers.pop(getattr(peer, 'address', ''), None)
+            await peer.disconnect()
+            logger.info("🔌 Peer {} disconnected".format(
+                getattr(peer, 'address', '?')
+            ))
+
+    # ── Message dispatch ────────────────────────────────────────────────
+
+    async def _handle_message(self, peer, msg):
+        """Route an incoming message to the appropriate handler."""
+        msg_type = msg.get("type", "")
+        payload = msg.get("payload", {})
+
+        if msg_type == "block":
+            await self._on_block(peer, payload)
+        elif msg_type == "tx":
+            await self._on_tx(peer, payload)
+        elif msg_type == "getblocks":
+            await self._on_getblocks(peer, payload)
+        elif msg_type == "blocks":
+            await self._on_blocks(peer, payload)
+        elif msg_type == "ping":
+            await peer.send("pong", {"nonce": payload.get("nonce")})
+        elif msg_type == "pong":
+            pass
+        elif msg_type == "getaddr":
+            await self._on_getaddr(peer)
+        elif msg_type == "addr":
+            await self._on_addr(payload)
+        elif msg_type == "version":
+            pass  # Already handled in handshake
+        else:
+            logger.debug("Unknown message '{}' from {}".format(
+                msg_type, peer.address
+            ))
+
+    # ── Block handling ──────────────────────────────────────────────────
+
+    async def _on_block(self, peer, payload):
+        """Handle a newly announced block from a peer."""
+        try:
+            block = Block.deserialize(payload)
+        except Exception as e:
+            logger.debug("Bad block data from {}: {}".format(peer.address, e))
+            return
+
+        if block.block_hash in self._known_block_hashes:
+            return
+
+        try:
+            self.blockchain.add_block(block)
+            self._known_block_hashes.add(block.block_hash)
+
+            # Remove mined txs from mempool
+            for tx in block.transactions[1:]:
+                self.mempool.remove_transaction(tx.tx_hash)
+
+            self.blockchain.save()
+            self.mempool.save()
+
+            logger.info(
+                "📦 Block #{} from {} | hash={}…".format(
+                    block.height, peer.address, block.block_hash[:24]
+                )
+            )
+
+            # Fire callback (useful for miner to know a new block arrived)
+            if self.on_block_accepted:
+                self.on_block_accepted(block)
+
+            # Relay to other peers
+            await self.broadcast_block(block, exclude=peer.address)
+            peer.height = max(peer.height, block.height)
+
+        except ValueError as e:
+            logger.debug("Block #{} rejected: {}".format(block.height, e))
+
+    async def _on_tx(self, peer, payload):
+        """Handle a new transaction from a peer."""
+        try:
+            tx = Transaction.deserialize(payload)
+        except Exception as e:
+            logger.debug("Bad tx from {}: {}".format(peer.address, e))
+            return
+
+        if tx.tx_hash in self._known_tx_hashes:
+            return
+
+        if self.mempool.add_transaction(tx):
+            self._known_tx_hashes.add(tx.tx_hash)
+            self.mempool.save()
+            await self.broadcast_tx(tx, exclude=peer.address)
+
+    # ── Chain sync ──────────────────────────────────────────────────────
+
+    async def _sync_from_peer(self, peer):
+        """Download blocks we're missing from a peer (Initial Block Download)."""
+        our_height = self.blockchain.height
+        their_height = peer.height
+
+        logger.info(
+            "📥 Syncing blocks {}..{} from {}".format(
+                our_height + 1, their_height, peer.address
+            )
+        )
+
+        start = our_height + 1
+        while start <= their_height:
+            end = min(start + SYNC_BATCH - 1, their_height)
+            await peer.send("getblocks", {
+                "start_height": start,
+                "end_height": end,
+            })
+
+            try:
+                msg = await asyncio.wait_for(peer.recv(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("Sync timeout from {}".format(peer.address))
+                break
+
+            if not msg or msg.get("type") != "blocks":
+                # Might be a different message type — handle and retry
+                if msg:
+                    await self._handle_message(peer, msg)
+                continue
+
+            block_list = msg["payload"].get("blocks", [])
+            if not block_list:
+                break
+
+            for block_data in block_list:
+                try:
+                    block = Block.deserialize(block_data)
+                    self.blockchain.add_block(block)
+                    self._known_block_hashes.add(block.block_hash)
+                    logger.info("📦 Synced block #{}".format(block.height))
+                except ValueError as e:
+                    logger.warning("Sync block rejected: {}".format(e))
+                    self.blockchain.save()
+                    return
+
+            start = end + 1
+
+        self.blockchain.save()
+        logger.info(
+            "✅ Sync complete — chain height: {}".format(self.blockchain.height)
+        )
+
+    async def _on_getblocks(self, peer, payload):
+        """Peer is requesting blocks from us."""
+        start = payload.get("start_height", 0)
+        end = payload.get("end_height", start + SYNC_BATCH - 1)
+        end = min(end, self.blockchain.height)
+
+        blocks = []
+        for h in range(start, end + 1):
+            block = self.blockchain.get_block_by_height(h)
+            if block:
+                blocks.append(block.serialize())
+
+        await peer.send("blocks", {"blocks": blocks})
+        logger.debug("Sent {} blocks ({}..{}) to {}".format(
+            len(blocks), start, end, peer.address
+        ))
+
+    async def _on_blocks(self, peer, payload):
+        """Handle a batch of blocks (async response to getblocks)."""
+        for block_data in payload.get("blocks", []):
+            try:
+                block = Block.deserialize(block_data)
+                if block.block_hash not in self._known_block_hashes:
+                    self.blockchain.add_block(block)
+                    self._known_block_hashes.add(block.block_hash)
+                    logger.info("📦 Block #{} synced".format(block.height))
+            except ValueError as e:
+                logger.debug("Block rejected during batch: {}".format(e))
+        self.blockchain.save()
+
+    # ── Broadcasting ────────────────────────────────────────────────────
+
+    async def broadcast_block(self, block, exclude=""):
+        """Send a new block to all connected peers."""
+        data = block.serialize()
+        for addr, peer in list(self.peers.items()):
+            if addr != exclude:
+                await peer.send("block", data)
+        self._known_block_hashes.add(block.block_hash)
+
+    async def broadcast_tx(self, tx, exclude=""):
+        """Send a new transaction to all connected peers."""
+        data = tx.serialize()
+        for addr, peer in list(self.peers.items()):
+            if addr != exclude:
+                await peer.send("tx", data)
+        self._known_tx_hashes.add(tx.tx_hash)
+
+    # ── Peer discovery ──────────────────────────────────────────────────
+
+    async def _on_getaddr(self, peer):
+        addrs = [
+            {"host": p.host, "port": p.listen_port}
+            for p in self.peers.values()
+            if p.address != peer.address
+        ]
+        await peer.send("addr", {"addresses": addrs})
+
+    async def _on_addr(self, payload):
+        for addr in payload.get("addresses", []):
+            host = addr["host"]
+            port = addr["port"]
+            key = "{}:{}".format(host, port)
+            if key not in self.peers:
+                await self.connect_to_peer(host, port)
+
+    # ── Peer persistence ────────────────────────────────────────────────
 
     def _save_peers(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         data = [
-            {"host": p.host, "port": p.port, "last_seen": p.last_seen}
+            {"host": p.host, "port": p.listen_port, "last_seen": time.time()}
             for p in self.peers.values()
         ]
         with open(PEERS_FILE, "w") as f:
@@ -351,13 +506,14 @@ class Node:
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # --- Status --------------------------------------------------------------
+    # ── Status ──────────────────────────────────────────────────────────
 
-    def get_status(self) -> dict:
+    def get_status(self):
         return {
             "host": self.host,
             "port": self.port,
             "peers": len(self.peers),
+            "peer_list": [p.address for p in self.peers.values()],
             "chain_height": self.blockchain.height,
             "mempool_size": self.mempool.size,
         }

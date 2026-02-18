@@ -1,0 +1,15 @@
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.pt
+*.pth
+.env
+*.log
+
+# Data files (don't commit chain/wallet data)
+chain.json
+wallet.json
+peers.json

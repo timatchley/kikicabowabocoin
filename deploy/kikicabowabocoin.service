@@ -1,0 +1,52 @@
+# ============================================================================
+# KikicabowaboCoin Node — systemd service
+# ============================================================================
+# Install:
+#   sudo cp deploy/kikicabowabocoin.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable kikicabowabocoin
+#   sudo systemctl start kikicabowabocoin
+#
+# Logs:
+#   journalctl -u kikicabowabocoin -f
+# ============================================================================
+
+[Unit]
+Description=KikicabowaboCoin (KIKI) Full Node
+Documentation=https://github.com/kikicabowabocoin/kikicabowabocoin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kiki
+Group=kiki
+
+# Working directory and data
+WorkingDirectory=/opt/kikicabowabocoin
+Environment="HOME=/opt/kikicabowabocoin"
+
+# Start the node
+ExecStart=/opt/kikicabowabocoin/venv/bin/kiki node --port 44144
+
+# Graceful shutdown
+ExecStop=/bin/kill -SIGINT $MAINPID
+TimeoutStopSec=30
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/kikicabowabocoin/.kikicabowabocoin
+PrivateTmp=yes
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

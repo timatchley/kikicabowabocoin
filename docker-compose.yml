@@ -1,0 +1,55 @@
+# ============================================================================
+# KikicabowaboCoin — Docker Compose
+# ============================================================================
+# Quick start:
+#   docker compose up -d          # Start a non-mining node
+#   docker compose --profile mine up -d   # Start node + miner
+#   docker compose logs -f        # Watch logs
+#   docker compose exec kiki-node kiki info   # Check chain
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # Full node (always runs)
+  # --------------------------------------------------------------------------
+  kiki-node:
+    build: .
+    container_name: kiki-node
+    restart: unless-stopped
+    ports:
+      - "44144:44144"   # P2P
+      - "44145:44145"   # RPC
+    volumes:
+      - kiki-data:/root/.kikicabowabocoin
+    environment:
+      - KIKI_LOG_LEVEL=INFO
+    command: ["node", "--port", "44144"]
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "kikicabowabocoin"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --------------------------------------------------------------------------
+  # Mining node (opt-in via --profile mine)
+  # --------------------------------------------------------------------------
+  kiki-miner:
+    build: .
+    container_name: kiki-miner
+    restart: unless-stopped
+    profiles:
+      - mine
+    ports:
+      - "44146:44144"   # Different host port to avoid conflict
+    volumes:
+      - kiki-data:/root/.kikicabowabocoin
+    environment:
+      - KIKI_LOG_LEVEL=INFO
+    command: ["node", "--port", "44144", "--mine"]
+    depends_on:
+      kiki-node:
+        condition: service_healthy
+
+volumes:
+  kiki-data:
+    driver: local

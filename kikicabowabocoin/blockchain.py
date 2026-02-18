@@ -228,7 +228,8 @@ class Blockchain:
 
         actual_time = last_block.header.timestamp - prev_block.header.timestamp
 
-        # Clamp actual time to reasonable bounds
+        # Clamp actual time to reasonable bounds (ensure int throughout)
+        actual_time = int(actual_time)
         actual_time = max(actual_time, TARGET_BLOCK_TIME // DIGISHIELD_MAX_ADJUST_DOWN)
         actual_time = min(actual_time, TARGET_BLOCK_TIME * DIGISHIELD_MAX_ADJUST_UP)
 

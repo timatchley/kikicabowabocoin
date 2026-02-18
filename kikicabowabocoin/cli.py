@@ -202,8 +202,9 @@ def cmd_mine(args):
             # Remove mined txs from mempool
             for tx in block.transactions[1:]:
                 mempool.remove_transaction(tx.tx_hash)
+            # Save after every block so other commands can see progress
+            bc.save()
 
-    bc.save()
     wallet.save()
 
     status = miner.get_status()

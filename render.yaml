@@ -1,0 +1,16 @@
+# Render Blueprint — deploy the seed tracker with one click
+# https://render.com/docs/blueprint-spec
+#
+# Deploy: https://render.com/deploy?repo=https://github.com/timatchley/kikicabowabocoin
+
+services:
+  - type: web
+    name: kikicabowabocoin-seed
+    runtime: python
+    plan: free
+    buildCommand: pip install -e .
+    startCommand: python -m kikicabowabocoin.seed_tracker
+    healthCheckPath: /api/status
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"

@@ -482,8 +482,8 @@ def build_parser() -> argparse.ArgumentParser:
         "seed", help="Run a seed tracker (peer discovery service)"
     )
     seed_p.add_argument(
-        "--port", type=int, default=44147,
-        help="HTTP port for the seed tracker (default: 44147)",
+        "--port", type=int, default=None,
+        help="HTTP port (default: $PORT or 44147)",
     )
     seed_p.add_argument(
         "--host", type=str, default="0.0.0.0",

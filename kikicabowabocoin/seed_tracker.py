@@ -23,6 +23,7 @@ Or deploy anywhere (Render, fly.io, Railway, a VPS, your Pi, etc.)
 
 import json
 import logging
+import os
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Lock
@@ -222,8 +223,11 @@ class SeedTrackerHandler(BaseHTTPRequestHandler):
         })
 
 
-def run_seed_tracker(host: str = "0.0.0.0", port: int = 44147):
+def run_seed_tracker(host: str = "0.0.0.0", port: int = None):
     """Start the seed tracker HTTP server."""
+    # Render (and most PaaS) set $PORT — use it if no explicit port given
+    if port is None:
+        port = int(os.environ.get("PORT", 44147))
     server = HTTPServer((host, port), SeedTrackerHandler)
     logger.info(
         "🌱 Seed tracker running on {}:{} — ready for peer registrations".format(
@@ -243,3 +247,15 @@ def run_seed_tracker(host: str = "0.0.0.0", port: int = 44147):
     except KeyboardInterrupt:
         print("\n  Seed tracker shut down.")
         server.shutdown()
+
+
+# Allow running directly: python -m kikicabowabocoin.seed_tracker
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    run_seed_tracker(port=port)

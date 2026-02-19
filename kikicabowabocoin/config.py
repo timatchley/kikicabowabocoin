@@ -32,7 +32,7 @@ MAX_PEERS = 125
 
 SEED_TRACKER_URL = os.environ.get(
     "KIKI_SEED_TRACKER",
-    "https://seed.kikicabowabo.coin/api",  # default — override via env var
+    "https://kikicabowabocoin-seed.onrender.com/api",
 )
 SEED_TRACKER_INTERVAL = 300     # Re-register / re-query every 5 minutes
 

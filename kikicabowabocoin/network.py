@@ -28,6 +28,8 @@ from kikicabowabocoin.config import (
     DATA_DIR,
     PEERS_FILE,
     SEED_NODES,
+    SEED_TRACKER_URL,
+    SEED_TRACKER_INTERVAL,
     MAGIC_BYTES,
 )
 from kikicabowabocoin.blockchain import Block, Blockchain
@@ -211,6 +213,124 @@ class LanDiscovery:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Seed Tracker Client — HTTP-based internet peer discovery
+# ───────────────────────────────────────────────────────────────────────────
+
+class SeedTrackerClient:
+    """
+    Client for the KikicabowaboCoin seed tracker HTTP service.
+
+    Handles internet-scale peer discovery by:
+    1. Registering this node with a seed tracker so others can find us
+    2. Querying the tracker for peers when we need more connections
+
+    This is the internet equivalent of LAN broadcast — it lets nodes
+    across the globe find each other without hardcoded IPs.
+
+    Any node can run a tracker (``kiki seed``).  Nodes can query
+    multiple trackers for redundancy.
+    """
+
+    def __init__(self, node: "Node", tracker_url: str = SEED_TRACKER_URL):
+        self.node = node
+        self.tracker_url = tracker_url.rstrip("/")
+        self._running = False
+
+    async def start(self):
+        """Begin periodic registration and peer queries."""
+        self._running = True
+        # Immediate first registration + query
+        asyncio.ensure_future(self._register_and_query())
+        # Then periodically
+        asyncio.ensure_future(self._tracker_loop())
+
+    async def stop(self):
+        self._running = False
+
+    async def _tracker_loop(self):
+        """Periodically register and query the tracker."""
+        while self._running:
+            await asyncio.sleep(SEED_TRACKER_INTERVAL)
+            await self._register_and_query()
+
+    async def _register_and_query(self):
+        """Register ourselves, then fetch peers."""
+        loop = asyncio.get_event_loop()
+
+        # Register
+        try:
+            await loop.run_in_executor(None, self._do_register)
+        except Exception as e:
+            logger.debug("Seed tracker register failed: {}".format(e))
+
+        # Query for peers
+        try:
+            peers = await loop.run_in_executor(None, self._do_query)
+            for p in peers:
+                host = p.get("host", "")
+                port = p.get("port", DEFAULT_PORT)
+                addr = "{}:{}".format(host, port)
+                if addr not in self.node.peers:
+                    logger.info(
+                        "🌐 Discovered peer {} (height={}) via seed tracker".format(
+                            addr, p.get("height", "?")
+                        )
+                    )
+                    await self.node.connect_to_peer(host, port)
+        except Exception as e:
+            logger.debug("Seed tracker query failed: {}".format(e))
+
+    def _do_register(self):
+        """POST to /api/register (blocking, runs in executor)."""
+        import urllib.request
+        import urllib.error
+
+        url = self.tracker_url + "/register"
+        data = json.dumps({
+            "port": self.node.port,
+            "height": self.node.blockchain.height,
+            "version": "1.0.0",
+        }).encode()
+
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                logger.debug(
+                    "📋 Registered with seed tracker: {}".format(
+                        result.get("your_address", "?")
+                    )
+                )
+        except (urllib.error.URLError, OSError) as e:
+            logger.debug("Tracker {} unreachable: {}".format(url, e))
+
+    def _do_query(self):
+        """GET /api/peers (blocking, runs in executor)."""
+        import urllib.request
+        import urllib.error
+
+        url = self.tracker_url + "/peers"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                peers = result.get("peers", [])
+                if peers:
+                    logger.debug(
+                        "📋 Seed tracker returned {} peers".format(len(peers))
+                    )
+                return peers
+        except (urllib.error.URLError, OSError) as e:
+            logger.debug("Tracker {} unreachable: {}".format(url, e))
+            return []
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Peer connection — wraps a reader/writer pair
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -312,6 +432,7 @@ class Node:
         self._server = None
         self._seed_peers = set()  # (host, port) pairs to reconnect to
         self._discovery = None    # LAN discovery instance
+        self._tracker = None      # Seed tracker client instance
 
         # Callback fired when a new block is accepted (from peer or mined)
         self.on_block_accepted = None
@@ -348,11 +469,23 @@ class Node:
         else:
             logger.info("📡 LAN discovery disabled by user")
 
+        # Start seed tracker client (internet peer discovery)
+        if not getattr(self, '_tracker_disabled', False):
+            self._tracker = SeedTrackerClient(self)
+            await self._tracker.start()
+            logger.info("🌐 Seed tracker client active → {}".format(
+                SEED_TRACKER_URL
+            ))
+        else:
+            logger.info("🌐 Seed tracker disabled by user")
+
         # Start background reconnect loop
         asyncio.ensure_future(self._reconnect_loop())
 
     async def stop(self):
         """Gracefully shut down."""
+        if self._tracker:
+            await self._tracker.stop()
         if self._discovery:
             await self._discovery.stop()
         if self._server:

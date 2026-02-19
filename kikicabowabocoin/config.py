@@ -17,9 +17,28 @@ DISCOVERY_PORT = 44146          # UDP port for LAN peer discovery broadcasts
 DISCOVERY_INTERVAL = 30         # Seconds between discovery broadcasts
 MAGIC_BYTES = b"\xc1\xc1\xca\xb0"  # Network magic for packet framing
 MAX_PEERS = 125
+
+# --- Peer Discovery (internet-scale) ---
+#
+# How a brand-new node finds its first peer (most → least decentralized):
+#
+#   1. LAN broadcast  — UDP beacon on 255.255.255.255:44146 (same subnet only)
+#   2. Seed tracker   — lightweight HTTP registry any node can run
+#   3. DNS seeds      — domain names that resolve to known node IPs
+#   4. Hardcoded IPs  — static fallback baked into the binary
+#   5. --peer flag    — manual override
+#
+# Once connected to ONE peer, gossip (getaddr/addr) handles the rest.
+
+SEED_TRACKER_URL = os.environ.get(
+    "KIKI_SEED_TRACKER",
+    "https://seed.kikicabowabo.coin/api",  # default — override via env var
+)
+SEED_TRACKER_INTERVAL = 300     # Re-register / re-query every 5 minutes
+
 SEED_NODES = [
-    # Hardcoded bootstrap nodes — real decentralized networks ship these
-    # so brand-new nodes can find the network without knowing any IP.
+    # Hardcoded bootstrap nodes (DNS seeds or static IPs).
+    # A real network would ship 3-5 of these maintained by trusted operators:
     # ("seed1.kikicabowabo.coin", DEFAULT_PORT),
     # ("seed2.kikicabowabo.coin", DEFAULT_PORT),
 ]

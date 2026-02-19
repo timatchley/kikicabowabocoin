@@ -262,11 +262,18 @@ def cmd_node(args):
     if getattr(args, 'no_discovery', False):
         node._discovery_disabled = True
 
+    # Disable seed tracker if requested
+    if getattr(args, 'no_tracker', False):
+        node._tracker_disabled = True
+
     print(BANNER.format(version=__version__, ticker=__ticker__))
-    print(f"  Starting node on port {args.port}…")
+    print(f"  Starting node on port {args.port}...")
     print(f"  Chain height: {bc.height}")
     if not getattr(args, 'no_discovery', False):
-        print(f"  📡 LAN peer discovery: enabled (automatic)")
+        print("  LAN peer discovery: enabled (automatic)")
+    if not getattr(args, 'no_tracker', False):
+        from kikicabowabocoin.config import SEED_TRACKER_URL
+        print(f"  Seed tracker: {SEED_TRACKER_URL}")
     if args.peers:
         print(f"  Manual peers: {', '.join(args.peers)}")
     print()
@@ -387,6 +394,12 @@ def cmd_genesis(args):
     print(f"{'═' * 60}\n")
 
 
+def cmd_seed(args):
+    """Run a seed tracker (peer discovery service for internet nodes)."""
+    from kikicabowabocoin.seed_tracker import run_seed_tracker
+    run_seed_tracker(host=args.host, port=args.port)
+
+
 # ===========================================================================
 # Argument parser
 # ===========================================================================
@@ -459,6 +472,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-discovery", action="store_true",
         help="Disable automatic LAN peer discovery (UDP broadcast)",
     )
+    node_p.add_argument(
+        "--no-tracker", action="store_true",
+        help="Disable seed tracker registration/queries (HTTP)",
+    )
+
+    # seed (tracker)
+    seed_p = subparsers.add_parser(
+        "seed", help="Run a seed tracker (peer discovery service)"
+    )
+    seed_p.add_argument(
+        "--port", type=int, default=44147,
+        help="HTTP port for the seed tracker (default: 44147)",
+    )
+    seed_p.add_argument(
+        "--host", type=str, default="0.0.0.0",
+        help="Bind address (default: 0.0.0.0)",
+    )
 
     return parser
 
@@ -486,6 +516,7 @@ def main():
         "mine": cmd_mine,
         "block": cmd_block,
         "node": cmd_node,
+        "seed": cmd_seed,
     }
 
     if args.command in commands:

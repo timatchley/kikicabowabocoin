@@ -466,6 +466,216 @@ def cmd_genesis(args):
     print(f"{'═' * 60}\n")
 
 
+def cmd_ledger(args):
+    """Show all addresses on the blockchain with balances and transaction history."""
+    bc = get_blockchain()
+
+    # ── Pass 1: walk every block, build address histories ──────────────────
+    # address → {"received": int, "sent": int, "txs": [tx_record, ...]}
+    histories = {}
+
+    for block in bc.chain:
+        for tx in block.transactions:
+            is_coinbase = tx.is_coinbase()
+
+            # Determine input addresses + amounts (skip for coinbase)
+            input_info = []
+            if not is_coinbase:
+                for inp in tx.inputs:
+                    utxo_key = f"{inp.prev_tx_hash}:{inp.output_index}"
+                    # Look up the original output in the full chain
+                    src_tx_hash = inp.prev_tx_hash
+                    src_idx     = inp.output_index
+                    src_out     = _find_output(bc, src_tx_hash, src_idx)
+                    if src_out:
+                        input_info.append((src_out.address, src_out.amount))
+
+            # Record outputs (received side)
+            for out_idx, out in enumerate(tx.outputs):
+                addr = out.address
+                if addr not in histories:
+                    histories[addr] = {"received": 0, "sent": 0, "txs": []}
+                histories[addr]["received"] += out.amount
+                histories[addr]["txs"].append({
+                    "block":    block.height,
+                    "time":     block.header.timestamp,
+                    "txid":     tx.tx_hash,
+                    "type":     "coinbase" if is_coinbase else "receive",
+                    "amount":   +out.amount,
+                    "from":     "coinbase" if is_coinbase else (input_info[0][0] if input_info else "?"),
+                })
+
+            # Record inputs (sent side) — debit the sender
+            for src_addr, src_amount in input_info:
+                if src_addr not in histories:
+                    histories[src_addr] = {"received": 0, "sent": 0, "txs": []}
+                histories[src_addr]["sent"] += src_amount
+                # Find matching output amounts going to non-self addresses
+                to_addrs = [o.address for o in tx.outputs if o.address != src_addr]
+                to_str = to_addrs[0] if len(to_addrs) == 1 else f"{len(to_addrs)} addresses"
+                # Only add a "sent" record once per tx per sender
+                if not any(t["txid"] == tx.tx_hash and t["type"] == "send"
+                           for t in histories[src_addr]["txs"]):
+                    sent_amt = sum(o.amount for o in tx.outputs if o.address != src_addr)
+                    histories[src_addr]["txs"].append({
+                        "block":  block.height,
+                        "time":   block.header.timestamp,
+                        "txid":   tx.tx_hash,
+                        "type":   "send",
+                        "amount": -sent_amt,
+                        "to":     to_str,
+                    })
+
+    # ── Pass 2: compute current balance from UTXO set ─────────────────────
+    balances = {}
+    for key, utxo in bc.utxo_set.items():
+        balances[utxo.address] = balances.get(utxo.address, 0) + utxo.amount
+
+    # ── Filter ──────────────────────────────────────────────────────────────
+    target = getattr(args, "address", None)
+
+    # ── Render ──────────────────────────────────────────────────────────────
+    W = 72
+
+    # Sort by current balance descending, skip zero-balance coinbase-only
+    # addresses unless --all is set
+    show_all = getattr(args, "all", False)
+
+    sorted_addrs = sorted(
+        histories.keys(),
+        key=lambda a: balances.get(a, 0),
+        reverse=True,
+    )
+
+    if target:
+        sorted_addrs = [a for a in sorted_addrs if a == target]
+        if not sorted_addrs:
+            print(f"\n  No transactions found for {target}\n")
+            return
+
+    # Mempool pending
+    mempool = Mempool.load()
+    pending = {}  # address → pending amount
+    for tx in mempool.get_transactions():
+        for out in tx.outputs:
+            pending[out.address] = pending.get(out.address, 0) + out.amount
+
+    print(f"\n{'═' * W}")
+    print(f"  {__coin_name__} — Blockchain Ledger  (height #{bc.height})")
+    print(f"{'═' * W}")
+
+    shown = 0
+    for addr in sorted_addrs:
+        hist = histories[addr]
+        balance = balances.get(addr, 0)
+        pending_amt = pending.get(addr, 0)
+
+        # Skip pure-zero-balance mining addresses unless --all
+        if balance == 0 and not show_all and not pending_amt:
+            continue
+        # Skip pure coinbase receivers (miners) unless --all or --address
+        all_coinbase = all(t["type"] == "coinbase" for t in hist["txs"])
+        if all_coinbase and not show_all and not target:
+            continue
+
+        shown += 1
+        print(f"\n  {'─' * (W - 2)}")
+        print(f"  Address : {addr}")
+        print(f"  Balance : {balance:>12,} {__ticker__}", end="")
+        if pending_amt:
+            print(f"  (+{pending_amt:,} pending)", end="")
+        print()
+        print(f"  Received: {hist['received']:>12,} {__ticker__}   "
+              f"Sent: {hist['sent']:>12,} {__ticker__}")
+        print(f"  {'─' * (W - 2)}")
+
+        # Transaction history (newest first, capped unless --all)
+        tx_rows = sorted(hist["txs"], key=lambda t: t["block"], reverse=True)
+        if not show_all:
+            tx_rows = tx_rows[:10]
+
+        for row in tx_rows:
+            ts   = time.strftime("%Y-%m-%d %H:%M", time.localtime(row["time"]))
+            amt  = row["amount"]
+            sign = "+" if amt >= 0 else "-"
+            kind = row["type"].upper()[:7]
+
+            if row["type"] in ("receive", "coinbase"):
+                counterpart = f"  from {row.get('from', '?')[:36]}"
+            else:
+                counterpart = f"  to   {row.get('to',   '?')[:36]}"
+
+            print(f"    #{row['block']:<5} {ts}  {sign}{abs(amt):>9,} KIKI  "
+                  f"{kind:<7}{counterpart}")
+
+        if len(hist["txs"]) > 10 and not show_all:
+            print(f"    … {len(hist['txs']) - 10} more (use --all to show all)")
+
+    if shown == 0:
+        print(f"\n  No non-miner addresses found. Use --all to show miners.\n")
+
+    print(f"\n{'═' * W}")
+    print(f"  Total addresses with activity : {len(histories):,}")
+    print(f"  Addresses with balance > 0    : {len([a for a, b in balances.items() if b > 0]):,}")
+    if pending:
+        print(f"  Mempool pending               : {sum(pending.values()):,} KIKI across {len(pending)} addresses")
+    print(f"{'═' * W}\n")
+
+
+def _find_output(bc, tx_hash: str, output_index: int):
+    """Walk the chain to find a specific transaction output by hash+index."""
+    for block in bc.chain:
+        for tx in block.transactions:
+            if tx.tx_hash == tx_hash:
+                if output_index < len(tx.outputs):
+                    return tx.outputs[output_index]
+    return None
+
+
+def cmd_tx(args):
+    """Look up a specific transaction by ID."""
+    bc = get_blockchain()
+    txid = args.txid
+
+    for block in bc.chain:
+        for tx in block.transactions:
+            if tx.tx_hash.startswith(txid):
+                W = 62
+                print(f"\n{'═' * W}")
+                print(f"  Transaction")
+                print(f"{'═' * W}")
+                print(f"  TxID  : {tx.tx_hash}")
+                print(f"  Block : #{block.height}  ({time.ctime(block.header.timestamp)})")
+                print(f"  Type  : {'COINBASE' if tx.is_coinbase() else 'TRANSFER'}")
+                print(f"{'─' * W}")
+                if not tx.is_coinbase():
+                    print(f"  Inputs:")
+                    for inp in tx.inputs:
+                        src = _find_output(bc, inp.prev_tx_hash, inp.output_index)
+                        addr = src.address if src else "?"
+                        amt  = src.amount  if src else 0
+                        print(f"    {addr}  -{amt:,} KIKI")
+                print(f"  Outputs:")
+                for out in tx.outputs:
+                    print(f"    {out.address}  +{out.amount:,} KIKI")
+                print(f"{'═' * W}\n")
+                return
+
+    # Check mempool
+    mempool = Mempool.load()
+    for tx in mempool.get_transactions():
+        if tx.tx_hash.startswith(txid):
+            print(f"\n  Transaction {tx.tx_hash}")
+            print(f"  Status: PENDING (in mempool, not yet mined)")
+            print(f"  Outputs:")
+            for out in tx.outputs:
+                print(f"    {out.address}  +{out.amount:,} KIKI")
+            print()
+            return
+
+    print(f"\n  Transaction '{txid}' not found in chain or mempool.\n")
+
+
 def cmd_seed(args):
     """Run a seed tracker (peer discovery service for internet nodes)."""
     from kikicabowabocoin.seed_tracker import run_seed_tracker
@@ -569,6 +779,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bind address (default: 0.0.0.0)",
     )
 
+    # ledger
+    ledger_p = subparsers.add_parser(
+        "ledger", help="Show all addresses and balances on the blockchain"
+    )
+    ledger_p.add_argument(
+        "--all", action="store_true",
+        help="Include miner-only addresses and show full tx history",
+    )
+    ledger_p.add_argument(
+        "--address", type=str, default=None,
+        help="Filter to a single address",
+    )
+
+    # tx
+    tx_p = subparsers.add_parser("tx", help="Look up a transaction by TxID")
+    tx_p.add_argument("txid", type=str, help="Transaction ID (full or prefix)")
+
     return parser
 
 
@@ -598,6 +825,8 @@ def main():
         "block": cmd_block,
         "node": cmd_node,
         "seed": cmd_seed,
+        "ledger": cmd_ledger,
+        "tx": cmd_tx,
     }
 
     if args.command in commands:

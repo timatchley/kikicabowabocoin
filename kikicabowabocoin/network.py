@@ -734,6 +734,7 @@ class Node:
             if not block_list:
                 break
 
+            reorged = False
             for block_data in block_list:
                 try:
                     block = Block.deserialize(block_data)
@@ -750,6 +751,7 @@ class Node:
                             )
                             # Restart sync from the new tip
                             start = self.blockchain.height + 1
+                            reorged = True
                             break
                         else:
                             logger.warning("Sync block rejected (no reorg): {}".format(e))
@@ -760,7 +762,8 @@ class Node:
                         self.blockchain.save()
                         return
 
-            start = end + 1
+            if not reorged:
+                start = end + 1
 
         self.blockchain.save()
         logger.info(
@@ -768,48 +771,32 @@ class Node:
         )
 
     async def _try_reorg(self, peer, bad_block: "Block") -> int:
-        """Walk back our chain to find a common ancestor with `peer`, then reorg.
+        """Roll back our chain so the bad block can connect on the next sync pass.
 
-        Returns the number of blocks rolled back (0 = failed, no reorg).
+        bad_block failed because its prev_hash doesn't match our tip.
+        We roll back to height (bad_block.height - 2) so the next sync
+        will re-request the canonical version of every block from there on.
+
+        For the typical 1-deep fork this removes 1 stale block.
+        For deeper forks each sync pass removes one more; they converge.
+
+        Returns the number of blocks rolled back (0 = refused).
         """
         MAX_REORG = 30
         our_height = self.blockchain.height
+        target_height = bad_block.height - 2   # roll back to just below bad_block
+        depth = our_height - target_height
 
-        for depth in range(1, min(MAX_REORG, our_height) + 1):
-            candidate_height = our_height - depth + 1   # height of the block we want to add
-            # Ask peer for the block just *before* bad_block (going back depth blocks)
-            ancestor_height = our_height - depth
-            await peer.send("getblocks", {
-                "start_height": ancestor_height,
-                "end_height": ancestor_height,
-            })
-            try:
-                msg = await asyncio.wait_for(peer.recv(), timeout=15)
-            except asyncio.TimeoutError:
-                return 0
+        if depth <= 0 or depth > MAX_REORG:
+            return 0
 
-            if not msg or msg.get("type") != "blocks":
-                return 0
-
-            block_list = msg["payload"].get("blocks", [])
-            if not block_list:
-                return 0
-
-            peer_ancestor = Block.deserialize(block_list[0])
-
-            # Check: does our chain have this same block?
-            our_ancestor = self.blockchain.get_block_by_height(ancestor_height)
-            if our_ancestor and our_ancestor.block_hash == peer_ancestor.block_hash:
-                # Found the common ancestor — roll back to here and let sync continue
-                logger.warning(
-                    "🔀 Fork detected at height {} — rolling back {} block(s)".format(
-                        ancestor_height, depth
-                    )
-                )
-                self.blockchain.rollback(depth)
-                return depth
-
-        return 0
+        logger.warning(
+            "🔀 Fork at height {} — rolling back {} block(s) (height {} → {})".format(
+                bad_block.height - 1, depth, our_height, our_height - depth
+            )
+        )
+        self.blockchain.rollback(depth)
+        return depth
 
     async def _on_getblocks(self, peer, payload):
         """Peer is requesting blocks from us."""

@@ -741,9 +741,24 @@ class Node:
                     self._known_block_hashes.add(block.block_hash)
                     logger.info("📦 Synced block #{}".format(block.height))
                 except ValueError as e:
-                    logger.warning("Sync block rejected: {}".format(e))
-                    self.blockchain.save()
-                    return
+                    # prev_hash mismatch — try to find common ancestor and reorg
+                    if "prev_hash mismatch" in str(e):
+                        reorg_depth = await self._try_reorg(peer, block)
+                        if reorg_depth > 0:
+                            logger.info(
+                                "🔀 Reorg {} block(s) to resolve fork".format(reorg_depth)
+                            )
+                            # Restart sync from the new tip
+                            start = self.blockchain.height + 1
+                            break
+                        else:
+                            logger.warning("Sync block rejected (no reorg): {}".format(e))
+                            self.blockchain.save()
+                            return
+                    else:
+                        logger.warning("Sync block rejected: {}".format(e))
+                        self.blockchain.save()
+                        return
 
             start = end + 1
 
@@ -751,6 +766,50 @@ class Node:
         logger.info(
             "✅ Sync complete — chain height: {}".format(self.blockchain.height)
         )
+
+    async def _try_reorg(self, peer, bad_block: "Block") -> int:
+        """Walk back our chain to find a common ancestor with `peer`, then reorg.
+
+        Returns the number of blocks rolled back (0 = failed, no reorg).
+        """
+        MAX_REORG = 30
+        our_height = self.blockchain.height
+
+        for depth in range(1, min(MAX_REORG, our_height) + 1):
+            candidate_height = our_height - depth + 1   # height of the block we want to add
+            # Ask peer for the block just *before* bad_block (going back depth blocks)
+            ancestor_height = our_height - depth
+            await peer.send("getblocks", {
+                "start_height": ancestor_height,
+                "end_height": ancestor_height,
+            })
+            try:
+                msg = await asyncio.wait_for(peer.recv(), timeout=15)
+            except asyncio.TimeoutError:
+                return 0
+
+            if not msg or msg.get("type") != "blocks":
+                return 0
+
+            block_list = msg["payload"].get("blocks", [])
+            if not block_list:
+                return 0
+
+            peer_ancestor = Block.deserialize(block_list[0])
+
+            # Check: does our chain have this same block?
+            our_ancestor = self.blockchain.get_block_by_height(ancestor_height)
+            if our_ancestor and our_ancestor.block_hash == peer_ancestor.block_hash:
+                # Found the common ancestor — roll back to here and let sync continue
+                logger.warning(
+                    "🔀 Fork detected at height {} — rolling back {} block(s)".format(
+                        ancestor_height, depth
+                    )
+                )
+                self.blockchain.rollback(depth)
+                return depth
+
+        return 0
 
     async def _on_getblocks(self, peer, payload):
         """Peer is requesting blocks from us."""

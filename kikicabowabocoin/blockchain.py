@@ -310,6 +310,26 @@ class Blockchain:
         self._add_block_to_chain(block)
         return True
 
+    def rollback(self, n: int = 1):
+        """Remove the last `n` blocks and rebuild UTXO set from remaining chain."""
+        if n <= 0 or n >= len(self.chain):
+            return
+        self.chain = self.chain[:-n]
+        self._rebuild_state()
+
+    def _rebuild_state(self):
+        """Rebuild block_index and utxo_set by replaying self.chain from scratch."""
+        self.utxo_set = {}
+        self.block_index = {}
+        for block in self.chain:
+            self.block_index[block.block_hash] = block
+            for tx in block.transactions:
+                if not tx.is_coinbase():
+                    for inp in tx.inputs:
+                        self.utxo_set.pop(f"{inp.prev_tx_hash}:{inp.output_index}", None)
+                for idx, out in enumerate(tx.outputs):
+                    self.utxo_set[f"{tx.tx_hash}:{idx}"] = out
+
     def _add_block_to_chain(self, block: Block):
         """Internal: append block and update UTXO set."""
         self.chain.append(block)

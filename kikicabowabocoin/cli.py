@@ -135,6 +135,78 @@ def cmd_wallet_balance(args):
     print(f"  Balance: {balance:,} {__ticker__}\n")
 
 
+def cmd_wallet_paper(args):
+    """Create a standalone wallet for someone else and print their credentials."""
+    from kikicabowabocoin.wallet import (
+        generate_private_key, private_key_to_public_key,
+        public_key_to_address, private_key_to_wif,
+    )
+
+    name = args.name or "wallet"
+    label = name
+
+    # Generate fresh key pair
+    priv = generate_private_key()
+    pub  = private_key_to_public_key(priv)
+    addr = public_key_to_address(pub)
+    wif  = private_key_to_wif(priv)
+
+    # Save to a separate wallet file so it can be handed to the recipient
+    wallet_path = os.path.join(DATA_DIR, f"{name}.wallet.json")
+    recipient_wallet = Wallet(filepath=wallet_path)
+    recipient_wallet.generate_address.__doc__  # ensure class loaded
+    from kikicabowabocoin.wallet import KeyPair
+    kp = KeyPair(private_key=priv, public_key=pub, address=addr, label=label)
+    recipient_wallet.keys = [kp]
+    recipient_wallet._address_index = {addr: kp}
+    recipient_wallet.save()
+
+    width = 62
+    print(f"\n{'═' * width}")
+    print(f"  {__coin_name__} — Wallet for: {name}")
+    print(f"{'═' * width}")
+    print(f"  Address:     {addr}")
+    print(f"  Private Key: {wif}")
+    print(f"{'─' * width}")
+    print(f"  Wallet file: {wallet_path}")
+    print(f"{'─' * width}")
+    print(f"  ⚠️  Share the address freely. Keep the private key SECRET.")
+    print(f"  To import on their machine:")
+    print(f"    kiki wallet import --wif {wif} --label {name}")
+    print(f"{'═' * width}\n")
+
+
+def cmd_wallet_import(args):
+    """Import a WIF private key into this wallet."""
+    from kikicabowabocoin.wallet import wif_to_private_key, private_key_to_public_key, public_key_to_address
+    try:
+        priv = wif_to_private_key(args.wif)
+    except ValueError as e:
+        print(f"\n❌ Invalid WIF key: {e}\n")
+        return
+
+    pub  = private_key_to_public_key(priv)
+    addr = public_key_to_address(pub)
+
+    wallet = get_wallet()
+    if addr in wallet._address_index:
+        print(f"\n⚠️  Address {addr} is already in your wallet.\n")
+        return
+
+    label = args.label or f"imported-{len(wallet.keys)}"
+    from kikicabowabocoin.wallet import KeyPair
+    kp = KeyPair(private_key=priv, public_key=pub, address=addr, label=label)
+    wallet.keys.append(kp)
+    wallet._address_index[addr] = kp
+    wallet.save()
+
+    bc = get_blockchain()
+    balance = bc.get_balance(addr)
+    print(f"\n✅ Imported address: {addr}")
+    print(f"   Label:   {label}")
+    print(f"   Balance: {balance:,} {__ticker__}\n")
+
+
 def cmd_send(args):
     """Send KIKI coins to another address."""
     wallet = get_wallet()
@@ -436,6 +508,13 @@ def build_parser() -> argparse.ArgumentParser:
     balance_p = wallet_sub.add_parser("balance", help="Check address balance")
     balance_p.add_argument("address", type=str, help="Address to check")
 
+    paper_p = wallet_sub.add_parser("paper", help="Create a wallet for someone else")
+    paper_p.add_argument("--name", type=str, default="", help="Recipient name (used as label and filename)")
+
+    import_p = wallet_sub.add_parser("import", help="Import a WIF private key")
+    import_p.add_argument("--wif", type=str, required=True, help="WIF-encoded private key")
+    import_p.add_argument("--label", type=str, default="", help="Label for the imported address")
+
     # send
     send_p = subparsers.add_parser("send", help="Send KIKI coins")
     send_p.add_argument("to_address", type=str, help="Recipient address")
@@ -511,6 +590,8 @@ def main():
             "create": cmd_wallet_create,
             "list": cmd_wallet_list,
             "balance": cmd_wallet_balance,
+            "paper": cmd_wallet_paper,
+            "import": cmd_wallet_import,
         }.get(a.wallet_cmd, lambda _: parser.parse_args(["wallet", "-h"]))(a),
         "send": cmd_send,
         "mine": cmd_mine,

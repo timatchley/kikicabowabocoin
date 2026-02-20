@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from kikicabowabocoin.config import ADDRESS_PREFIX, DATA_DIR, WALLET_FILE
+from kikicabowabocoin.config import ADDRESS_PREFIX, PRIVKEY_PREFIX, DATA_DIR, WALLET_FILE
 from kikicabowabocoin.crypto import (
     base58check_encode,
     base58check_decode,
@@ -159,6 +159,33 @@ def public_key_to_address(public_key: bytes) -> str:
     """
     h = hash160(public_key)
     return base58check_encode(ADDRESS_PREFIX, h)
+
+
+def private_key_to_wif(private_key: int) -> str:
+    """
+    Encode a private key in WIF (Wallet Import Format).
+
+    Same as Dogecoin WIF: Base58Check( PRIVKEY_PREFIX + key + 0x01 )
+    The 0x01 suffix signals the corresponding public key is compressed.
+    """
+    key_bytes = private_key.to_bytes(32, "big")
+    return base58check_encode(PRIVKEY_PREFIX, key_bytes + b"\x01")
+
+
+def wif_to_private_key(wif: str) -> int:
+    """
+    Decode a WIF private key back to an integer.
+    Strips the compression flag byte if present.
+    """
+    prefix, payload = base58check_decode(wif)
+    if prefix != PRIVKEY_PREFIX:
+        raise ValueError("WIF prefix mismatch — wrong network?")
+    # Strip compression flag (last byte 0x01) if present
+    if len(payload) == 33 and payload[-1] == 0x01:
+        payload = payload[:-1]
+    if len(payload) != 32:
+        raise ValueError("Invalid WIF key length")
+    return int.from_bytes(payload, "big")
 
 
 def public_key_bytes_to_point(pub_bytes: bytes):
